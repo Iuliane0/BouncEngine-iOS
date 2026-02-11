@@ -63,7 +63,7 @@ final class GameViewController: UIViewController {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "nativeBridge")
+        webView?.configuration.userContentController.removeAllScriptMessageHandlers()
     }
 
     // MARK: - Native Loading View
@@ -138,7 +138,7 @@ final class GameViewController: UIViewController {
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
 
         // ── Message handler for JS → Native communication ──
-        config.userContentController.addScriptMessageHandler(self, name: "nativeBridge")
+        config.userContentController.add(self, name: "nativeBridge")
 
         // ── Injected JS: AudioContext tracker + native loading bridge ──
         // Runs BEFORE any page script. Responsibilities:

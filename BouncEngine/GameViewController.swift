@@ -9,6 +9,16 @@ final class GameViewController: UIViewController {
     private var webView: WKWebView!
     private let gameURL = URL(string: "https://bouncengi.net")!
 
+    // Native loading overlay (mirrors web's .loading-overlay)
+    private var nativeLoadingView: UIView!
+    private var nativeLoadingLabel: UILabel!
+    private var nativeSpinner: UIActivityIndicatorView!
+    private var hasHiddenNativeLoading = false
+
+    // Offline retry
+    private var navigationRetryCount = 0
+    private let maxNavigationRetries = 3
+
     // MARK: - Orientation (landscape only)
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
@@ -19,8 +29,8 @@ final class GameViewController: UIViewController {
     override var prefersStatusBarHidden: Bool { true }
 
     // MARK: - Home indicator dimmed (not auto-hidden)
-    // This makes the home indicator visible but dimmed. The user must swipe once
-    // to "activate" it, then swipe again to actually trigger the gesture.
+    // preferredScreenEdgesDeferringSystemGestures makes the bar visible but dimmed.
+    // User must swipe once to "activate" it, then swipe again to trigger the gesture.
 
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
     override var prefersHomeIndicatorAutoHidden: Bool { false }
@@ -30,10 +40,10 @@ final class GameViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        // Match the web app's background color (#0a0a12)
-        view.backgroundColor = UIColor(red: 0.039, green: 0.039, blue: 0.071, alpha: 1)
+        view.backgroundColor = UIColor(red: 0.094, green: 0.094, blue: 0.094, alpha: 1) // #181818
 
         setupWebView()
+        setupNativeLoadingView()
         loadGame()
 
         NotificationCenter.default.addObserver(
@@ -42,10 +52,74 @@ final class GameViewController: UIViewController {
             name: .resumeWebAudio,
             object: nil
         )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "nativeBridge")
+    }
+
+    // MARK: - Native Loading View
+
+    private func setupNativeLoadingView() {
+        nativeLoadingView = UIView()
+        nativeLoadingView.backgroundColor = UIColor(red: 0.094, green: 0.094, blue: 0.094, alpha: 1) // #181818
+        nativeLoadingView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(nativeLoadingView)
+
+        NSLayoutConstraint.activate([
+            nativeLoadingView.topAnchor.constraint(equalTo: view.topAnchor),
+            nativeLoadingView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            nativeLoadingView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            nativeLoadingView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
+
+        // Spinner
+        nativeSpinner = UIActivityIndicatorView(style: .medium)
+        nativeSpinner.color = .white
+        nativeSpinner.translatesAutoresizingMaskIntoConstraints = false
+        nativeSpinner.startAnimating()
+        nativeLoadingView.addSubview(nativeSpinner)
+
+        // Label
+        nativeLoadingLabel = UILabel()
+        nativeLoadingLabel.text = "Checking for updates..."
+        nativeLoadingLabel.textColor = .white
+        nativeLoadingLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+        nativeLoadingLabel.textAlignment = .center
+        nativeLoadingLabel.translatesAutoresizingMaskIntoConstraints = false
+        nativeLoadingView.addSubview(nativeLoadingLabel)
+
+        NSLayoutConstraint.activate([
+            nativeSpinner.centerXAnchor.constraint(equalTo: nativeLoadingView.centerXAnchor),
+            nativeSpinner.centerYAnchor.constraint(equalTo: nativeLoadingView.centerYAnchor, constant: -12),
+            nativeLoadingLabel.topAnchor.constraint(equalTo: nativeSpinner.bottomAnchor, constant: 10),
+            nativeLoadingLabel.centerXAnchor.constraint(equalTo: nativeLoadingView.centerXAnchor),
+            nativeLoadingLabel.leadingAnchor.constraint(greaterThanOrEqualTo: nativeLoadingView.leadingAnchor, constant: 20),
+            nativeLoadingLabel.trailingAnchor.constraint(lessThanOrEqualTo: nativeLoadingView.trailingAnchor, constant: -20)
+        ])
+    }
+
+    private func hideNativeLoading(animated: Bool = true) {
+        guard !hasHiddenNativeLoading else { return }
+        hasHiddenNativeLoading = true
+
+        if animated {
+            UIView.animate(withDuration: 0.25, animations: {
+                self.nativeLoadingView.alpha = 0
+            }, completion: { _ in
+                self.nativeLoadingView.removeFromSuperview()
+            })
+        } else {
+            nativeLoadingView.removeFromSuperview()
+        }
     }
 
     // MARK: - WebView Setup
@@ -53,44 +127,93 @@ final class GameViewController: UIViewController {
     private func setupWebView() {
         let config = WKWebViewConfiguration()
 
-        // ── Data store: default (persists Service Workers, Cache API, IndexedDB, localStorage) ──
+        // ── Persistent data store: keeps Service Workers, Cache API, IndexedDB, localStorage ──
         config.websiteDataStore = WKWebsiteDataStore.default()
 
-        // ── Media: allow inline playback, no user-action requirement ──
+        // ── Media: inline playback, no user-action requirement for audio ──
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
         // ── JavaScript ──
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
 
-        // ── AudioContext tracker: injected BEFORE any page script runs ──
-        let audioTrackerJS = """
+        // ── Message handler for JS → Native communication ──
+        config.userContentController.addScriptMessageHandler(self, name: "nativeBridge")
+
+        // ── Injected JS: AudioContext tracker + native loading bridge ──
+        // Runs BEFORE any page script. Responsibilities:
+        // 1. Tracks AudioContexts for resume-after-interruption
+        // 2. Signals DOMContentLoaded (web took over loading UX → hide native splash)
+        // 3. Forwards loading text changes to native overlay
+        // 4. Signals when web's loading overlay hides (caching complete)
+        let injectedJS = """
         (function() {
+            // ── AudioContext tracking ──
             window._bounceAudioContexts = [];
             var _Orig = window.AudioContext || window.webkitAudioContext;
-            if (!_Orig) return;
-
-            window.AudioContext = function AudioContext(opts) {
-                var ctx = opts ? new _Orig(opts) : new _Orig();
-                window._bounceAudioContexts.push(ctx);
-                return ctx;
-            };
-            window.AudioContext.prototype = _Orig.prototype;
-
-            if (window.webkitAudioContext) {
-                window.webkitAudioContext = window.AudioContext;
+            if (_Orig) {
+                window.AudioContext = function AudioContext(opts) {
+                    var ctx = opts ? new _Orig(opts) : new _Orig();
+                    window._bounceAudioContexts.push(ctx);
+                    return ctx;
+                };
+                window.AudioContext.prototype = _Orig.prototype;
+                if (window.webkitAudioContext) {
+                    window.webkitAudioContext = window.AudioContext;
+                }
             }
+
+            // ── Native bridge ──
+            function sendToNative(type, data) {
+                try {
+                    window.webkit.messageHandlers.nativeBridge.postMessage({
+                        type: type,
+                        data: data || {}
+                    });
+                } catch(e) {}
+            }
+
+            // ── DOMContentLoaded: game container becomes visible (.ready), web loading overlay shows ──
+            document.addEventListener('DOMContentLoaded', function() {
+                sendToNative('dom_ready', {});
+
+                // Forward loading text changes to native overlay
+                var lt = document.getElementById('loadingText');
+                if (lt) {
+                    sendToNative('loading_text', {text: lt.textContent});
+                    new MutationObserver(function() {
+                        sendToNative('loading_text', {text: lt.textContent});
+                    }).observe(lt, {childList: true, characterData: true, subtree: true});
+                }
+
+                // Watch loading overlay — when it gets .hidden class, caching is done
+                var lo = document.getElementById('loadingOverlay');
+                if (lo) {
+                    new MutationObserver(function() {
+                        if (lo.classList.contains('hidden')) {
+                            sendToNative('web_loading_hidden', {});
+                        }
+                    }).observe(lo, {attributes: true, attributeFilter: ['class']});
+                    // Already hidden (returning visit where cache is complete)
+                    if (lo.classList.contains('hidden')) {
+                        sendToNative('web_loading_hidden', {});
+                    }
+                }
+            });
         })();
         """
+
         let userScript = WKUserScript(
-            source: audioTrackerJS,
+            source: injectedJS,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         )
         config.userContentController.addUserScript(userScript)
 
-        // ── User agent suffix so the site can detect the native wrapper if needed ──
-        config.applicationNameForUserAgent = "BouncEngine-iOS"
+        // ── Do NOT set applicationNameForUserAgent ──
+        // The web code checks !window.isNativeApp to decide whether to run SW logic.
+        // We intentionally leave isNativeApp unset: the web's service worker should
+        // register, check for updates, and cache files exactly like in a browser.
 
         // ── Create WKWebView ──
         webView = WKWebView(frame: .zero, configuration: config)
@@ -98,7 +221,7 @@ final class GameViewController: UIViewController {
         webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
 
-        // Transparent backing so the background color shows during load
+        // Transparent backing so #181818 native bg shows during load
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
@@ -131,12 +254,12 @@ final class GameViewController: UIViewController {
     // MARK: - Load
 
     private func loadGame() {
-        webView.load(URLRequest(url: gameURL))
+        let request = URLRequest(url: gameURL, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 15)
+        webView.load(request)
     }
 
     // MARK: - AudioContext Resume
 
-    /// Evaluates JS to resume every tracked AudioContext that was suspended/interrupted.
     func resumeAudioContext() {
         let js = """
         (function() {
@@ -154,6 +277,51 @@ final class GameViewController: UIViewController {
     @objc private func onResumeWebAudio() {
         resumeAudioContext()
     }
+
+    @objc private func appDidBecomeActive() {
+        resumeAudioContext()
+    }
+}
+
+// MARK: - WKScriptMessageHandler
+
+extension GameViewController: WKScriptMessageHandler {
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard let body = message.body as? [String: Any],
+              let type = body["type"] as? String else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            switch type {
+            case "dom_ready":
+                // Web page DOM loaded → game container is visible → web's loading overlay is showing.
+                // The web has taken over the loading UX. Hide native splash after a brief paint delay.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    self.hideNativeLoading()
+                }
+
+            case "loading_text":
+                // Mirror web's loading text on native overlay while it's still visible
+                if !self.hasHiddenNativeLoading,
+                   let data = body["data"] as? [String: Any],
+                   let text = data["text"] as? String {
+                    self.nativeLoadingLabel?.text = text
+                }
+
+            case "web_loading_hidden":
+                // Web's loading overlay hidden (caching complete). Ensure native is gone too.
+                self.hideNativeLoading()
+
+            default:
+                break
+            }
+        }
+    }
 }
 
 // MARK: - WKNavigationDelegate
@@ -161,7 +329,7 @@ final class GameViewController: UIViewController {
 extension GameViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // Ensure viewport-fit=cover is set (belt-and-suspenders)
+        // Ensure viewport-fit=cover
         let js = """
         (function() {
             var meta = document.querySelector('meta[name=viewport]');
@@ -171,6 +339,9 @@ extension GameViewController: WKNavigationDelegate {
         })();
         """
         webView.evaluateJavaScript(js, completionHandler: nil)
+
+        // Reset retry counter on successful navigation
+        navigationRetryCount = 0
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -182,9 +353,26 @@ extension GameViewController: WKNavigationDelegate {
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        // Network error — the service worker cache-first strategy should prevent this
-        // in most cases, but handle it gracefully.
-        print("[WebView] Provisional navigation failed: \(error.localizedDescription)")
+        // Provisional navigation failed — likely offline on cold start.
+        // The service worker from a previous session may need a moment to activate
+        // before it can intercept fetch requests and serve from cache.
+        // Retry with increasing delays to give the SW time.
+        let nsError = error as NSError
+        print("[WebView] Provisional navigation failed (\(nsError.code)): \(nsError.localizedDescription)")
+
+        if navigationRetryCount < maxNavigationRetries {
+            navigationRetryCount += 1
+            let delay = Double(navigationRetryCount) * 1.0
+            nativeLoadingLabel?.text = "Connecting..."
+            print("[WebView] Retry \(navigationRetryCount)/\(maxNavigationRetries) in \(delay)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.loadGame()
+            }
+        } else {
+            // All retries failed — no connection and no cached content
+            nativeLoadingLabel?.text = "No connection. Restart when online."
+            nativeSpinner?.stopAnimating()
+        }
     }
 
     func webView(
@@ -192,7 +380,6 @@ extension GameViewController: WKNavigationDelegate {
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        // Allow all navigation within bouncengi.net + needed CDNs
         if let url = navigationAction.request.url {
             let host = url.host ?? ""
             if host.isEmpty
@@ -217,7 +404,6 @@ extension GameViewController: WKNavigationDelegate {
 
 extension GameViewController: WKUIDelegate {
 
-    /// Handle window.open() by loading in the same webview
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,

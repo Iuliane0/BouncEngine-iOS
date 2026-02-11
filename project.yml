@@ -15,7 +15,10 @@ targets:
   BouncEngine:
     type: application
     platform: iOS
-    sources: [BouncEngine]
+    sources:
+      - path: BouncEngine
+        excludes:
+          - Entitlements.plist
     settings:
       base:
         INFOPLIST_FILE: BouncEngine/Info.plist
@@ -26,7 +29,9 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGN_IDENTITY: ""
         PROVISIONING_PROFILE_SPECIFIER: ""
+        CODE_SIGN_ENTITLEMENTS: BouncEngine/Entitlements.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: "NO"
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        SWIFT_STRICT_CONCURRENCY: minimal

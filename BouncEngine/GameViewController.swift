@@ -1,5 +1,5 @@
 import UIKit
-import WebKit
+@preconcurrency import WebKit
 import AVFoundation
 
 final class GameViewController: UIViewController {

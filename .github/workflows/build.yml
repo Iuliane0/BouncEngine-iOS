@@ -25,17 +25,22 @@ jobs:
 
       - name: Build for iOS device (unsigned)
         run: |
+          set -o pipefail
           xcodebuild build \
             -project BouncEngine.xcodeproj \
             -scheme BouncEngine \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            | xcpretty --color
+            SWIFT_STRICT_CONCURRENCY=minimal \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee build.log | xcpretty --color
+          echo "Build exit code: $?"
 
       - name: Package IPA
         run: |

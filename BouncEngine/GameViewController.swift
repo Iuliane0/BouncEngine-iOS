@@ -83,6 +83,9 @@ final class GameViewController: UIViewController {
         config.mediaTypesRequiringUserActionForPlayback = []
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
 
+        // App-Bound Domains: enables full Service Worker + Cache API support in WKWebView
+        config.limitsNavigationsToAppBoundDomains = true
+
         // AudioContext tracker — keeps references so we can resume after interruption
         let injectedJS = """
         (function() {
@@ -101,6 +104,20 @@ final class GameViewController: UIViewController {
         """
         config.userContentController.addUserScript(
             WKUserScript(source: injectedJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        )
+
+        // Fix font-display: the web uses @font-face for "Raylib" without font-display,
+        // defaulting to "block" which makes loading text INVISIBLE while the font downloads.
+        // Inject a replacement @font-face at documentEnd so it overrides the page's rule.
+        let fontFixJS = """
+        (function() {
+            var s = document.createElement('style');
+            s.textContent = '@font-face { font-family: "Raylib"; src: url("/raylib.ttf") format("opentype"); font-display: swap; }';
+            document.head.appendChild(s);
+        })();
+        """
+        config.userContentController.addUserScript(
+            WKUserScript(source: fontFixJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         )
 
         webView = WKWebView(frame: .zero, configuration: config)

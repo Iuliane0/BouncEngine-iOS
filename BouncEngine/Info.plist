@@ -71,5 +71,9 @@
     </dict>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <key>WKAppBoundDomains</key>
+    <array>
+        <string>bouncengi.net</string>
+    </array>
 </dict>
 </plist>

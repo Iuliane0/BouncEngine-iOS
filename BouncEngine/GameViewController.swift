@@ -71,6 +71,9 @@ final class GameViewController: UIViewController {
             self.splashView.alpha = 0
         }, completion: { _ in
             self.splashView.removeFromSuperview()
+            // Switch to opaque compositing now that splash is gone — saves GPU work
+            self.webView.isOpaque = true
+            self.webView.backgroundColor = UIColor(red: 0.094, green: 0.094, blue: 0.094, alpha: 1)
         })
     }
 
